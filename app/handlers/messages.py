@@ -16,7 +16,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"내재가치: ${analysis['intrinsic_value']}\n"
             f"안전마진: ${analysis['safety_margin']}%\n"
             f"매수추천: {'✅ 예' if analysis['buy_recommendation'] else '❌ 아니오'}\n"
-            f"주식설명: {analysis['description']}\n"
+            f"종목설명: {analysis['description']}\n"
         )
     else:
         message = f"❌ {ticker} 데이터를 가져올 수 없습니다."

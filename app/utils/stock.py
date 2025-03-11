@@ -1,56 +1,75 @@
 import yfinance as yf
 import pandas as pd
 import requests
+from functools import lru_cache
+from typing import List, Optional, Dict, Any
 from app.config.config import OPEN_ROUTER_API_KEY, OPEN_ROUTER_API_URL
 from app.utils.logging import setup_logging
-from app.utils.pe_mappings import industry_map, sector_fallback, pe_map
+from app.utils.pe_mapping import INDUSTRY_PE, SECTOR_FALLBACK
 
 logger = setup_logging()
 
-NASDAQ_TICKERS = []
-SP500_TICKERS = []
+NASDAQ_TICKERS: List[str] = []
+SP500_TICKERS: List[str] = []
 
-def fetch_sp500_tickers():
+def fetch_sp500_tickers() -> List[str]:
     try:
         url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        tables = pd.read_html(url)
+        tables = pd.read_html(url, attrs={"id": "constituents"})
         sp500_df = tables[0]
-        logger.info("Success get S&P 500")
-        return sp500_df["Symbol"].tolist()
+        tickers = sp500_df["Symbol"].str.replace(".", "-").tolist()
+        logger.info(f"Successfully fetched {len(tickers)} S&P 500 tickers")
+        return tickers
     except Exception as e:
-        logger.error(f"Failed S&P 500 | error: {e}")
+        logger.error(f"Failed to fetch S&P 500 tickers | error: {e}")
         return []
 
-def fetch_nasdaq_tickers():
+def fetch_nasdaq_tickers() -> List[str]:
     try:
-        url = "https://en.wikipedia.org/wiki/Nasdaq-100"
-        tables = pd.read_html(url)
-        nasdaq_df = tables[3]
-        logger.info("Success get Nasdaq 100")
-        return nasdaq_df["Ticker"].tolist()  # 'Symbol' 대신 'Ticker'로 수정 (문서 기준)
+        url = "https://api.nasdaq.com/api/quote/list-type/nasdaq100"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        tickers = [item["symbol"] for item in data["data"]["data"]["rows"]]
+        logger.info(f"Successfully fetched {len(tickers)} Nasdaq-100 tickers from Nasdaq API")
+        return tickers
     except Exception as e:
-        logger.error(f"Failed Nasdaq 100 | error: {e}")
+        logger.error(f"Failed to fetch Nasdaq-100 tickers from Nasdaq API | error: {e}")
         return []
 
-def fetch_stock_data(ticker, period="5y"):
+NASDAQ_TICKERS = fetch_nasdaq_tickers()
+SP500_TICKERS = fetch_sp500_tickers()
+
+@lru_cache(maxsize=128)
+def fetch_stock_data(ticker: str, period: str = "5y") -> Optional[pd.DataFrame]:
     try:
         stock = yf.Ticker(ticker)
-        df = stock.history(period=period)
-        if not df.empty:
-            logger.info(f"Success get {ticker} data")
-            return df
-        else:
-            logger.warning(f"{ticker} data is empty")
+        df = stock.history(period=period, auto_adjust=True)
+        if df.empty:
+            logger.warning(f"{ticker} historical data is empty")
             return None
+        logger.info(f"Successfully fetched {ticker} data | rows: {len(df)}")
+        return df
     except Exception as e:
-        logger.error(f"Failed get {ticker} data | error: {e}")
+        logger.error(f"Failed to fetch {ticker} data | error: {e}")
         return None
 
-def fetch_stock_description(ticker):
-    if not OPEN_ROUTER_API_KEY:
-        logger.warning("OPEN_ROUTER_API_KEY is not found.")
-        return ""
+@lru_cache(maxsize=128)
+def fetch_stock_info(ticker: str) -> Dict[str, Any]:
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info
+        logger.info(f"Successfully fetched {ticker} info")
+        return info
+    except Exception as e:
+        logger.error(f"Failed to fetch {ticker} info | error: {e}")
+        return {}
 
+def fetch_stock_description(ticker: str) -> str:
+    if not OPEN_ROUTER_API_KEY or not OPEN_ROUTER_API_URL:
+        logger.warning("Open Router API credentials not configured")
+        return "주식 요약을 가져올 수 없습니다."
     headers = {
         "Authorization": f"Bearer {OPEN_ROUTER_API_KEY}",
         "Content-Type": "application/json",
@@ -58,79 +77,99 @@ def fetch_stock_description(ticker):
     payload = {
         "model": "google/gemini-2.0-flash-001",
         "messages": [
-            {"role": "user", "content": f"{ticker} 주식에 대한 간단한 설명을 1문장으로 말해줘"}
+            {"role": "user", "content": f"{ticker} 주식에 대한 간단한 설명을 1문장으로 한국어로 제공해 주세요."}
         ],
+        "max_tokens": 50,
     }
-
     try:
-        response = requests.post(OPEN_ROUTER_API_URL, headers=headers, json=payload)
+        response = requests.post(OPEN_ROUTER_API_URL, headers=headers, json=payload, timeout=10)
         response.raise_for_status()
         result = response.json()
         description = result["choices"][0]["message"]["content"].strip()
-        logger.info(f"Success get {ticker} description: {description}")
+        logger.info(f"Successfully fetched {ticker} description: {description}")
         return description
+    except requests.Timeout:
+        logger.error(f"Open Router API timeout for {ticker}")
+        return f"{ticker}에 대한 요약을 가져오는 데 시간이 초과되었습니다."
     except Exception as e:
-        logger.error(f"Failed OpenRouter API ({ticker}) | error: {e}")
-        return f"Failed get {ticker} data"
+        logger.error(f"Failed to fetch {ticker} description via Open Router | error: {e}")
+        return f"{ticker}에 대한 요약을 가져올 수 없습니다."
 
-def get_industry_pe(ticker, info):
-    industry = info.get("industry", "Unknown")
-    sector = info.get("sector", "Unknown")
+def get_industry_pe(industry: str, sector: str, trailing_pe: Optional[float] = None) -> float:
+    industry_pe = INDUSTRY_PE.get(industry)
+    if industry_pe is None:
+        mapped_industry = SECTOR_FALLBACK.get(sector, "Total Market")
+        industry_pe = INDUSTRY_PE.get(mapped_industry, 20.0)  # 기본값을 20으로 현실화
+        logger.debug(f"Industry '{industry}' not found, using fallback '{mapped_industry}' PE: {industry_pe}")
     
-    nyu_industry = industry_map.get(industry)
-    if nyu_industry and nyu_industry in pe_map and not pd.isna(pe_map[nyu_industry]):
-        pe = pe_map[nyu_industry]
-    else:
-        nyu_industry = sector_fallback.get(sector, "Total Market")
-        pe = pe_map.get(nyu_industry, 15)
-    
-    logger.info(f"{ticker} industry P/E: {pe} (Yahoo Industry: {industry}, Mapped NYU Industry: {nyu_industry})")
-    return pe
+    # 현실적인 P/E로 조정: 상한선 30, 주식 trailingPE 반영
+    if trailing_pe and trailing_pe > 0:
+        realistic_pe = min(max(trailing_pe * 1.2, 15.0), 30.0)  # trailingPE의 1.2배, 15~30 범위
+        if industry_pe > 30:
+            logger.warning(f"Industry PE {industry_pe} too high, adjusted to {realistic_pe} based on trailing PE {trailing_pe}")
+            return realistic_pe
+    return min(industry_pe, 30.0)  # 상한선 30 적용
 
-def analyze_stock(ticker, safety_margin_threshold=0.3, min_conditions=2):
+@lru_cache(maxsize=128)
+def analyze_stock(ticker: str, safety_margin_threshold: float = 0.3, include_description: bool = True) -> Optional[Dict[str, Any]]:
     df = fetch_stock_data(ticker)
     if df is None:
         return None
     
-    current_price = df["Close"][-1]
-    info = yf.Ticker(ticker).info
+    info = fetch_stock_info(ticker)
+    if not info:
+        return None
     
+    current_price = df["Close"].iloc[-1]
     eps = info.get("trailingEps")
     if eps is None or eps <= 0:
-        logger.warning(f"{ticker} EPS unavailable or invalid")
+        logger.warning(f"{ticker} EPS unavailable or invalid: {eps}")
         return None
-    logger.info(f"{ticker} EPS: {eps}")
     
-    intrinsic_value = eps * get_industry_pe(ticker, info)
-    discount = (
-        (intrinsic_value - current_price) / intrinsic_value
-        if intrinsic_value > 0
-        else 0
-    )
+    industry = info.get("industry", "Default")
+    sector = info.get("sector", "Default")
+    trailing_pe = info.get("trailingPE", current_price / eps if eps > 0 else None)
+    industry_pe = get_industry_pe(industry, sector, trailing_pe)
+    intrinsic_value = eps * industry_pe
+    discount = ((intrinsic_value - current_price) / intrinsic_value) if intrinsic_value > 0 else 0
     safety_margin = discount * 100
+
+    if intrinsic_value > current_price * 5:  # 내재가치가 주가의 5배 이상이면 경고
+        logger.warning(f"{ticker} intrinsic value {intrinsic_value} seems high (current price: {current_price})")
+
+    pe_discount = ((industry_pe - trailing_pe) / industry_pe * 100) if trailing_pe and industry_pe else 0
     
-    # 나머지 로직 동일
     moat = (info.get("profitMargins", 0) > 0.1) and (info.get("returnOnEquity", 0) > 0.15)
     consistency = df["Close"].pct_change().std() < 0.03
-    cagr = ((df["Close"][-1] / df["Close"][0]) ** (1 / (len(df) / 252)) - 1) if len(df) > 0 else 0
+    cagr = ((df["Close"].iloc[-1] / df["Close"].iloc[0]) ** (1 / (len(df) / 252)) - 1) if len(df) > 0 else 0
     track_record = (len(df) > 252 * 3) and (cagr > 0.05)
     
-    description = fetch_stock_description(ticker)
     result = {
         "ticker": ticker,
         "current_price": round(current_price, 2),
+        "trailing_pe": round(trailing_pe, 2) if trailing_pe else None,
+        "industry_pe": round(industry_pe, 2),
         "intrinsic_value": round(intrinsic_value, 2),
         "safety_margin": round(safety_margin, 2),
+        "pe_discount": round(pe_discount, 2),
         "moat": moat,
         "consistency": consistency,
         "track_record": track_record,
         "cagr": round(cagr * 100, 2),
-        "description": description,
+        "is_nasdaq100": ticker in NASDAQ_TICKERS,
+        "is_sp500": ticker in SP500_TICKERS,
     }
+    
+    if include_description:
+        result["description"] = fetch_stock_description(ticker)
+    
     weights = {"moat": 0.4, "consistency": 0.3, "track_record": 0.3}
-    score = sum([weights[k] * result[k] for k in weights])
+    score = sum(weights[k] * result[k] for k in weights)
     result["score"] = round(score, 2)
     result["buy_recommendation"] = (discount > safety_margin_threshold) and (score >= 0.6)
     
+    logger.info(f"{ticker} | EPS: {eps}, Current Price: {current_price}, "
+                f"Intrinsic Value: {intrinsic_value}, Safety Margin: {safety_margin}%")
     logger.info(f"{ticker} analyze done | score = {result['score']} | recommend = {result['buy_recommendation']}")
+    
     return result

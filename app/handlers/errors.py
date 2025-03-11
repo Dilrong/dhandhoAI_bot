@@ -21,8 +21,8 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif isinstance(error, telegram.error.BadRequest):
         logger.error("Bad request sent to Telegram API.")
         user_message = "잘못된 요청입니다. 입력을 확인해주세요."
-    elif isinstance(error, telegram.error.Unauthorized):
-        logger.error("Unauthorized: Invalid token.")
+    elif isinstance(error, telegram.error.InvalidToken):  # Unauthorized 대신 InvalidToken 사용
+        logger.error("Invalid token: Unauthorized access.")
         user_message = "봇 토큰이 유효하지 않습니다. 관리자에게 문의해주세요."
     else:
         logger.error("Unhandled exception.")
