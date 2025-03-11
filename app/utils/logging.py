@@ -1,6 +1,8 @@
 import logging
 from logging.handlers import TimedRotatingFileHandler
 
+from app.config.config import APP_NAME
+
 def setup_logging():
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.INFO)
@@ -11,7 +13,7 @@ def setup_logging():
     console_handler.setFormatter(formatter)
 
     file_handler = TimedRotatingFileHandler(
-        filename='dhandho_bot.log',
+        filename=f"{APP_NAME}.log",
         when='midnight',  # 자정에 회전
         interval=1,       # 1일 간격
         backupCount=30,   # 30일치 보관
